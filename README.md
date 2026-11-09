@@ -1,4 +1,3 @@
-[![Build Status][travis-badge]][travis-link]
 [![AGPL Licence][licence-badge]](COPYING)
 Koreader Sync Server
 ========
@@ -12,6 +11,16 @@ server and use the sync service to keep all reading progress synchronized
 between devices.
 
 This project is licenced under Affero GPL v3, see the [COPYING](COPYING) file.
+
+The protocol
+------------
+
+The API is described in the third-party [kosync-conformance](https://github.com/pid1/kosync-conformance),
+together with a verifier that checks an implementation against it in one command.
+The description is observational rather than normative: it documents what this
+server does, and it notes where implementations in the wild disagree. The spec
+text is CC0, so anything in it may be copied here or anywhere else without
+attribution.
 
 Setup your own server
 ======================
@@ -45,7 +54,7 @@ docker compose up -d --build
 ```
 
 To setup the server manually, please refer to the commands used in
-[Dockerfile][dockerfile] and [travis config file][travis-conf].
+the [Dockerfile][dockerfile].
 
 You can use the following command to verify that the sync server is ready to serve traffic:
 
@@ -64,6 +73,36 @@ As you can see, the server responds over HTTPS using a self-signed certificate. 
       - 'traefik.http.routers.kosync.rule=Host(`kosync.example.com`)'
       - 'traefik.http.services.kosync.loadbalancer.server.port=17200'
 ```
+
+Deleting an account
+===================
+
+`DELETE /users/me` uses the `x-auth-user` and `x-auth-key` headers to delete an
+account and all its reading progress. Success returns HTTP 200 with
+`{"deleted":true}`. Invalid credentials return HTTP 401 (code 2001).
+
+An absent account returns HTTP 404 (code 2006, `Account not found.`), after
+removing any orphaned user data. This specific response confirms deletion after a
+lost response; a generic 404 or 401 does not.
+
+No deletion records are retained. Usernames can be registered again immediately
+with empty progress. Use a different password when re-registering: a stale deletion
+request cannot be distinguished from a new one if both credentials are reused.
+
+Changing a password
+===================
+
+`PUT /users/password` uses the current `x-auth-user` and `x-auth-key` headers and a
+JSON body of `{"password":"<replacement key>"}`. As with registration, supply a
+nonempty client-derived key (KOReader uses the password's MD5 hash).
+
+Success returns HTTP 200 with `{"updated":true}` and preserves reading progress.
+Update the saved password on all connected readers. This requires the current key;
+it does not provide forgotten-password recovery.
+
+Incorrect credentials and stale retries return HTTP 401. If a response is lost,
+confirm the replacement key with `GET /users/auth`. Invalid replacement values
+return HTTP 403 (code 2003).
 
 Privacy and security
 ========
@@ -87,8 +126,5 @@ the password is MD5 hashed at client when authorizing with the sync server.
 In addition, all data transferred between koreader devices and the sync server
 are secured by HTTPS (Hypertext Transfer Protocol Secure) connections.
 
-[travis-badge]:https://travis-ci.org/koreader/koreader-sync-server.svg?branch=master
-[travis-link]:https://travis-ci.org/koreader/koreader-sync-server
-[travis-conf]:https://github.com/koreader/koreader-sync-server/blob/master/.travis.yml
 [licence-badge]:http://img.shields.io/badge/licence-AGPL-brightgreen.svg
 [dockerfile]:https://github.com/koreader/koreader-sync-server/blob/master/Dockerfile

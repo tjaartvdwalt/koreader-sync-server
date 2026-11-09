@@ -16,9 +16,61 @@ local SyncsController = {
     error_invalid_fields = 2003,
     -- Do we really need to handle 'document' field specifically?
     error_document_field_missing = 2004,
+    error_user_registration_disabled = 2005,
+    error_account_not_found = 2006,
+    error_document_not_servable = 2007,
 }
 
 local null = ngx.null
+
+-- Authenticate and delete in one operation. Distinguish an absent account from
+-- a wrong key so callers can reconcile retries without retaining tombstones.
+local delete_user_script = [[
+local current_key = redis.call("GET", KEYS[1])
+if current_key and current_key ~= ARGV[2] then
+    return 0
+end
+local cursor = "0"
+local prefix = ARGV[1]
+local keys = {}
+repeat
+    local result = redis.call("SCAN", cursor, "COUNT", 100)
+    cursor = result[1]
+    for _, key in ipairs(result[2]) do
+        if string.sub(key, 1, string.len(prefix)) == prefix then
+            table.insert(keys, key)
+        end
+    end
+until cursor == "0"
+
+for _, key in ipairs(keys) do
+    redis.call("DEL", key)
+end
+if not current_key then
+    return 2
+end
+return 1
+]]
+
+-- Check authentication at the write itself: a request that authorized before
+-- deletion must not recreate a document afterward.
+local update_progress_script = [[
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call("HSET", KEYS[2], unpack(ARGV, 2))
+return 1
+]]
+
+-- Authenticate and update in one operation so concurrent changes using the
+-- same current key cannot both succeed. Document keys are never touched.
+local update_password_script = [[
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call("SET", KEYS[1], ARGV[2])
+return 1
+]]
 
 -- Whether a field is valid, i.e. not an empty string.
 local function is_valid_field(field)
@@ -30,11 +82,25 @@ local function is_valid_key_field(field)
     return is_valid_field(field) and not string.find(field, ":")
 end
 
+-- The read route binds :document against a fixed character class (see
+-- gin/core/routes.lua, build_named_parameters), so an id outside it is stored
+-- by PUT and then 404s at nginx before the controller is reached. Refuse it on
+-- the way in rather than accepting a write that can never be read back.
+local function is_servable_document(field)
+    return string.match(field, "^[A-Za-z0-9_]+$") ~= nil
+end
+
+-- gin builds a controller per request, so the handle lives exactly as long as
+-- the request does.
 function SyncsController:getRedis()
+    if self.redis then
+        return self.redis
+    end
     local redis = Redis:new()
     if not redis then
         self:raise_error(self.error_no_redis)
     else
+        self.redis = redis
         return redis
     end
 end
@@ -67,20 +133,63 @@ function SyncsController:create_user()
         self:raise_error(self.error_invalid_fields)
     end
 
-    local user_key = string.format(self.user_key, self.request.body.username)
-    local user, err = redis:get(user_key)
-    if user == null then
-        ok, err = redis:set(user_key, self.request.body.password)
-        if not ok then
-            self:raise_error(self.error_internal)
-        else
-            return 201, { username = self.request.body.username }
-        end
-    elseif user then
+    local created, err = redis:setnx(string.format(self.user_key, self.request.body.username),
+        self.request.body.password)
+    if created == 0 then
         self:raise_error(self.error_user_exists)
-    else
+    elseif created ~= 1 then
         self:raise_error(self.error_internal)
     end
+    return 201, { username = self.request.body.username }
+end
+
+function SyncsController:create_user_disabled()
+    self:raise_error(self.error_user_registration_disabled)
+end
+
+function SyncsController:delete_user()
+    local username = self.request.headers['x-auth-user']
+    local current_key = self.request.headers['x-auth-key']
+    if not is_valid_key_field(username) or not is_valid_field(current_key) then
+        self:raise_error(self.error_unauthorized_user)
+    end
+
+    local redis = self:getRedis()
+    local deleted, err = redis:eval(delete_user_script, 1,
+        string.format(self.user_key, username), "user:" .. username .. ":", current_key)
+    if deleted == 0 then
+        self:raise_error(self.error_unauthorized_user)
+    elseif deleted == 2 then
+        self:raise_error(self.error_account_not_found)
+    elseif deleted ~= 1 then
+        self:raise_error(self.error_internal)
+    end
+
+    return 200, { deleted = true }
+end
+
+function SyncsController:update_password()
+    local username = self.request.headers['x-auth-user']
+    local current_key = self.request.headers['x-auth-key']
+    if not is_valid_key_field(username) or not is_valid_field(current_key) then
+        self:raise_error(self.error_unauthorized_user)
+    end
+
+    local body = self.request.body
+    if type(body) ~= "table" or not is_valid_field(body.password) then
+        self:raise_error(self.error_invalid_fields)
+    end
+
+    local redis = self:getRedis()
+    local updated, err = redis:eval(update_password_script, 1,
+        string.format(self.user_key, username), current_key, body.password)
+    if updated == 0 then
+        self:raise_error(self.error_unauthorized_user)
+    elseif updated ~= 1 then
+        self:raise_error(self.error_internal)
+    end
+
+    return 200, { updated = true }
 end
 
 function SyncsController:get_progress()
@@ -144,6 +253,9 @@ function SyncsController:update_progress()
     if not is_valid_key_field(doc) then
         self:raise_error(self.error_document_field_missing)
     end
+    if not is_servable_document(doc) then
+        self:raise_error(self.error_document_not_servable)
+    end
 
     local percentage = tonumber(self.request.body.percentage)
     local progress = self.request.body.progress
@@ -152,14 +264,22 @@ function SyncsController:update_progress()
     local timestamp = os.time()
     if percentage and progress and device then
         local key = string.format(self.doc_key, username, doc)
-        local ok, err = redis:hmset(key, {
-            [self.percentage_field] = percentage,
-            [self.progress_field] = progress,
-            [self.device_field] = device,
-            [self.device_id_field] = device_id,
-            [self.timestamp_field] = timestamp,
-        })
-        if not ok then
+        local fields = {
+            self.request.headers['x-auth-key'],
+            self.percentage_field, percentage,
+            self.progress_field, progress,
+            self.device_field, device,
+            self.timestamp_field, timestamp,
+        }
+        if device_id ~= nil then
+            table.insert(fields, self.device_id_field)
+            table.insert(fields, device_id)
+        end
+        local updated, err = redis:eval(update_progress_script, 2,
+            string.format(self.user_key, username), key, unpack(fields))
+        if updated == 0 then
+            self:raise_error(self.error_unauthorized_user)
+        elseif updated ~= 1 then
             self:raise_error(self.error_internal)
         end
         return 200, {
@@ -173,6 +293,38 @@ end
 
 function SyncsController:healthcheck()
     return 200, { state = 'OK' }
+end
+
+-- gin dispatches straight to the action and turns raise_error into a response
+-- with pcall, so an action has no return point every path passes through. The
+-- connection goes back to the pool here, inside the content phase: nginx
+-- finalizes cosockets before log_by_lua runs, where set_keepalive fails with
+-- "closed".
+local function releasing(action)
+    return function(self, ...)
+        local ok, status, body, headers = pcall(action, self, ...)
+        if self.redis then
+            Redis.release(self.redis)
+            self.redis = nil
+        end
+        if not ok then
+            error(status, 0)
+        end
+        return status, body, headers
+    end
+end
+
+for _, action in ipairs({
+    "auth_user",
+    "create_user",
+    "create_user_disabled",
+    "delete_user",
+    "update_password",
+    "get_progress",
+    "update_progress",
+    "healthcheck"
+}) do
+    SyncsController[action] = releasing(SyncsController[action])
 end
 
 return SyncsController
